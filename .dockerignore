@@ -1,0 +1,19 @@
+# Never copy secrets or runtime data into the image.
+.env
+data/
+logs/
+docs/
+tests/
+scripts/
+
+# Python / tooling
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.git/
+.gitignore
+.DS_Store
+README.md

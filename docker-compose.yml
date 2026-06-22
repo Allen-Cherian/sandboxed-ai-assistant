@@ -1,0 +1,49 @@
+# Sandboxed AI Assistant — one-command runtime
+#
+#   docker compose up --build      then open  http://localhost:8501
+#
+# This file is where the sandbox is enforced (see docs/security_model.md §2).
+
+services:
+  assistant:
+    build: .
+    image: sandboxed-ai-assistant:v1
+    container_name: sandboxed-ai-assistant
+    ports:
+      - "8501:8501"
+
+    # Load optional, non-secret configuration. The app runs fine without it.
+    env_file:
+      - .env
+
+    # --- Sandbox / hardening ---------------------------------------------
+    # Root filesystem is read-only; the app may only write to the mounted
+    # volume and the tmpfs below.
+    read_only: true
+
+    # Drop ALL Linux capabilities — the app needs none of them.
+    cap_drop:
+      - ALL
+
+    # Prevent privilege escalation (setuid binaries cannot elevate).
+    security_opt:
+      - no-new-privileges:true
+
+    # Writable scratch space that does NOT touch the host. Sized + noexec so
+    # nothing can be written and then executed from /tmp.
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+
+    # The ONLY persistent writable area: a bind mount of ./data and ./logs.
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+
+    # Conservative resource ceilings to bound DoS impact.
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2g
+
+    restart: unless-stopped

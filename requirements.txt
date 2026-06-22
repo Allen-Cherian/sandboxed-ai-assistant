@@ -1,0 +1,15 @@
+# Pinned dependencies for the fully-local sandboxed AI assistant (V1).
+# No external LLM/API client is included — V1 is fully local by design.
+
+# CPU-only PyTorch. Without this, pip pulls the default CUDA build of torch
+# (~426 MB) plus ~1.5 GB of NVIDIA CUDA/cuDNN wheels we never use — the app does
+# CPU-only embeddings in a GPU-less container. --extra-index-url adds PyTorch's
+# CPU wheel index so the CPU build is selected instead.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.5.1
+
+streamlit==1.41.1
+chromadb==0.5.23
+sentence-transformers==3.3.1
+pypdf==5.1.0
+python-dotenv==1.0.1
