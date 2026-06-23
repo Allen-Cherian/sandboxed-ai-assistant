@@ -177,3 +177,17 @@ upload → index → ask → grounded answer with sources, inside the hardened s
 No authentication, no prompt-injection defense, single-tenant, Docker-default
 syscall filtering. See `docs/security_model.md` §8 and `docs/threat_model.md` for the
 full, honest list.
+
+---
+
+## 📚 Documentation
+
+| Document | What it covers | Start here if… |
+|----------|----------------|----------------|
+| [`docs/summary.md`](docs/summary.md) | One-page technical overview of the whole project. | …you want the gist fast. |
+| [`docs/implementation_plan.md`](docs/implementation_plan.md) | Architecture, scope, and the phased build plan. | …you want the design and structure. |
+| [`docs/security_model.md`](docs/security_model.md) | The security *policy*: runtime, filesystem, tool, secret, and logging boundaries + limitations. | …you want to know what's enforced. |
+| [`docs/tool_boundary_explained.md`](docs/tool_boundary_explained.md) | Line-level code walkthrough of the least-privilege tool allow-list (the *mechanism*). | …you want to see how least privilege is wired. |
+| [`docs/threat_model.md`](docs/threat_model.md) | Assets, trust boundaries, threats→mitigations, and explicitly-accepted risks. | …you want the "what we defend / what we don't." |
+| [`docs/setup_flow.md`](docs/setup_flow.md) | The exact one-command setup experience, first-run vs. repeat, reset. | …you're setting it up or troubleshooting. |
+| [`docs/progress_log.md`](docs/progress_log.md) | The full phase-by-phase build and bring-up history. | …you want the development story. |
