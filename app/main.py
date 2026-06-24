@@ -15,6 +15,7 @@ from __future__ import annotations
 # suspenders fallback for local `streamlit run app/main.py`.
 import os
 import sys
+import time
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
@@ -24,8 +25,9 @@ import streamlit as st
 
 from app.logger import audit
 from app.rag.embeddings import EmbeddingError
+from app.rag.llm import provider_health
 from app.rag.loaders import LoaderError, load_document
-from app.rag.qa import answer_question
+from app.rag.qa import answer_question, answer_question_llm
 from app.rag.vector_store import VectorStoreError, index_document
 from app.security.file_policy import FilePolicyError, store_upload
 from app.startup import ConfigError, run_startup
@@ -90,6 +92,35 @@ def main() -> None:
         _render_document_list(cfg)
 
 
+def _render_mode_selector(cfg) -> bool:
+    """Show the answer-mode control. Returns True if the user picked LLM mode.
+
+    The LLM option is only offered when it's both enabled in config AND the provider
+    is reachable; otherwise the app silently stays in extractive mode (the V1 default).
+    The health probe is cached per session so it doesn't run on every rerun.
+    """
+    if not cfg.llm_enabled:
+        return False
+
+    if "llm_health" not in st.session_state:
+        st.session_state.llm_health = provider_health(cfg)
+    healthy, detail = st.session_state.llm_health
+
+    if not healthy:
+        st.caption(f"💡 LLM mode is enabled but unavailable — {detail}. Using extractive.")
+        return False
+
+    mode = st.radio(
+        "Answer mode",
+        options=["Extractive (quote passages)", f"Generated (local LLM · {cfg.llm_model})"],
+        index=0,
+        horizontal=True,
+        help="Extractive quotes the most relevant passages. Generated writes an "
+        "answer with a local model, grounded in those same passages.",
+    )
+    return mode.startswith("Generated")
+
+
 def _render_ask(cfg) -> None:
     st.subheader("💬 Ask your documents")
 
@@ -102,6 +133,8 @@ def _render_ask(cfg) -> None:
         st.caption("Upload a document first, then ask a question about it.")
         return
 
+    use_llm = _render_mode_selector(cfg)
+
     question = st.text_input(
         "Your question",
         placeholder="e.g. What does the document say about access control?",
@@ -112,24 +145,34 @@ def _render_ask(cfg) -> None:
     if not (ask and question.strip()):
         return
 
+    started = time.monotonic()
     try:
-        with st.spinner("Retrieving relevant passages…"):
-            ans = answer_question(question, cfg)
+        spinner_msg = "Generating an answer…" if use_llm else "Retrieving relevant passages…"
+        with st.spinner(spinner_msg):
+            ans = answer_question_llm(question, cfg) if use_llm else answer_question(question, cfg)
     except (VectorStoreError, EmbeddingError, ToolExecutionError) as exc:
-        audit("qa_failed", reason=str(exc))
+        audit("qa_failed", reason=str(exc), mode="llm" if use_llm else "extractive")
         st.error(f"Could not answer: {exc}")
         return
+    latency_ms = int((time.monotonic() - started) * 1000)
 
     audit(
         "question_asked",
         # The question text is part of the audit trail; no secrets involved.
         question=question.strip(),
+        mode=ans.mode,
+        model=cfg.llm_model if ans.mode == "llm" else None,
         grounded=ans.grounded,
+        latency_ms=latency_ms,
+        fell_back=bool(ans.note),
         sources=[
             {"stored_name": src.get("stored_name"), "score": src.get("score")}
             for src in ans.sources
         ],
     )
+
+    if ans.note:
+        st.warning(f"⚠️ {ans.note}")
 
     st.markdown("### Answer")
     (st.success if ans.grounded else st.warning)(ans.text)

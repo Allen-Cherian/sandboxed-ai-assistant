@@ -53,8 +53,32 @@ def run_startup() -> Config:
         allowed_extensions=sorted(cfg.allowed_extensions),
         max_upload_mb=cfg.max_upload_mb,
         retrieval_top_k=cfg.retrieval_top_k,
+        llm_enabled=cfg.llm_enabled,
+        llm_provider=cfg.llm_provider if cfg.llm_enabled else None,
+        llm_model=cfg.llm_model if cfg.llm_enabled else None,
     )
+
+    if cfg.llm_enabled:
+        _check_llm_reachable(cfg)
+
     return cfg
+
+
+def _check_llm_reachable(cfg: Config) -> None:
+    """Non-blocking reachability probe for the configured LLM backend.
+
+    Logs status only — NEVER raises. If the LLM is unreachable the app still runs
+    fully (extractive mode); the UI degrades gracefully. This just surfaces a clear
+    signal in the logs so a misconfigured/offline Ollama is easy to diagnose.
+    """
+    try:
+        from app.rag.llm import provider_health
+
+        ok, detail = provider_health(cfg)
+    except Exception as exc:  # provider layer not present yet / import issue
+        audit("llm_health", reachable=False, provider=cfg.llm_provider, detail=str(exc))
+        return
+    audit("llm_health", reachable=ok, provider=cfg.llm_provider, detail=detail)
 
 
 __all__ = ["run_startup", "ConfigError"]

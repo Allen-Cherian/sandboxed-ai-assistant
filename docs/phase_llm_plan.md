@@ -80,6 +80,41 @@ designed. No new secret-handling code is needed.
 / OpenAI providers are left as a documented, empty slot — §10 specifies exactly how to
 add one.
 
+### 3.1 Preserving V1's security boundaries (the explicit check)
+
+Of V1's seven boundaries, **six are untouched** by this phase; exactly **one** changes
+(network egress), and it is scoped as tightly as possible. This section is the
+contract that keeps that promise.
+
+| V1 boundary | Effect of this phase |
+|-------------|----------------------|
+| Container hardening (non-root, read-only rootfs, `cap_drop ALL`, `no-new-privileges`, resource limits) | ✅ Unchanged. The model runs on the **host**; the container only makes a thin HTTP call (needs no capability, no write, no privilege). |
+| Filesystem confinement (`file_policy`, `data/`-only) | ✅ Unchanged. The LLM path does **zero** file I/O; it never sees a path. |
+| Tool allow-list / least privilege | ✅ Unchanged. The LLM is a **text generator, not an agent** — it gets **no tools**. Retrieval still happens via `call_tool` *before* the LLM is involved. |
+| Secret handling | ✅ Unchanged (still zero-key). Pattern ready for a future API key via the existing redaction/config path. |
+| Audit logging | ✅ Extended (mode/model/latency fields added), not weakened. |
+| Deny-by-default / safe default | ✅ Unchanged. `LLM_ENABLED=false` by default → app is byte-for-byte V1. |
+| **No outbound network** | ⚠️ **Changed** — adds one call: container → host Ollama. **Scoped below.** |
+
+**Scoped egress (the one change, kept tight):**
+- The container is allowed to reach **only** the configured Ollama host:port
+  (`host.docker.internal:11434`), via `extra_hosts` — **not** general internet access.
+  The default bridge network + published-port-only posture from V1 is otherwise kept.
+- The LLM client validates that `LLM_BASE_URL` points at the configured host and refuses
+  arbitrary URLs from elsewhere — the destination is config-controlled, not user- or
+  document-controlled.
+- General internet egress is opened **only** if/when an API provider is consciously
+  enabled (§10) — and that is documented as a deliberate trade-off at that time.
+
+**Bounded resource use (mirrors the V1 `top_k=20` ceiling):**
+- The LLM call has a **hard timeout** (`LLM_TIMEOUT_S`, default ~30s) and a **response
+  size / token cap**, so a slow or runaway model can't hang or exhaust the app.
+- On timeout/error/unreachable, the path **falls back to extractive** — never a crash.
+
+> Net statement: *every V1 boundary is preserved except the one we consciously opened
+> (network egress), and even that is scoped to a single local service with bounded
+> resource use and graceful fallback.*
+
 ---
 
 ## 4. New / changed components
@@ -87,10 +122,10 @@ add one.
 | File | Change |
 |------|--------|
 | `app/rag/llm/__init__.py` *(new)* | Provider interface (`LLMProvider` with `generate(prompt) -> str`) + `get_provider(cfg)` factory that selects by `LLM_PROVIDER`. Raises a clear error for unknown/unimplemented providers. |
-| `app/rag/llm/ollama_provider.py` *(new)* | `OllamaProvider`: thin HTTP client to host Ollama (`/api/generate`). Timeout, clear errors, no streaming for V1. Endpoint + model from config. |
+| `app/rag/llm/ollama_provider.py` *(new)* | `OllamaProvider`: thin HTTP client to host Ollama (`/api/generate`). **Hard timeout + response-size cap**, validates the target is the configured host (refuses arbitrary URLs), clear errors, no streaming for V1. Endpoint + model from config. |
 | `app/rag/llm/api_providers.py` *(new, stub)* | `AnthropicProvider` / `OpenAIProvider` placeholders that raise `NotImplementedError` with a pointer to §10. Keeps the factory total and the extension obvious. |
 | `app/rag/qa.py` | Add `answer_question_llm(...)`: retrieve (via the tool boundary, unchanged) → build a **grounded, injection-resistant prompt** → `get_provider(cfg).generate(...)` → return answer + the same source list. Keep existing extractive `answer_question` intact. |
-| `app/config.py` | New env: `LLM_ENABLED` (default false), `LLM_PROVIDER` (default `ollama`), `LLM_MODEL` (default `llama3.2:1b`), `LLM_BASE_URL` (default `http://host.docker.internal:11434`), `LLM_TIMEOUT_S`. (API keys like `ANTHROPIC_API_KEY` read here only if a future provider needs them.) |
+| `app/config.py` | New env: `LLM_ENABLED` (default false), `LLM_PROVIDER` (default `ollama`), `LLM_MODEL` (default `llama3.2:1b`), `LLM_BASE_URL` (default `http://host.docker.internal:11434`), `LLM_TIMEOUT_S` (default 30), `LLM_MAX_TOKENS` (response cap). (API keys like `ANTHROPIC_API_KEY` read here only if a future provider needs them.) |
 | `app/main.py` | A mode toggle ("Extractive ⟷ Generated"). LLM option only enabled if `LLM_ENABLED` and the model is reachable. New audit fields (mode, model, latency). Graceful fallback to extractive if the LLM is unreachable. |
 | `docker-compose.yml` | Add `extra_hosts: ["host.docker.internal:host-gateway"]` so the container can reach host Ollama on Linux/Docker. |
 | `.env.example` | Document the new `LLM_*` vars (all optional; default off). |
@@ -115,6 +150,9 @@ mitigations, kept deliberately simple:
    anything (the allow-list still governs all actions; the LLM is *not* an agent).
 4. **Grounding check** — answers still display the retrieved **sources**, so a user
    can verify the answer against the actual chunks.
+5. **Bounded execution** — the call is wrapped in a hard timeout + response-size cap
+   (see §3.1), so even a hostile or runaway generation can't hang or exhaust the app;
+   any failure falls back to extractive.
 
 Documented as *reduced, not eliminated* — full injection defense remains future work.
 
@@ -124,8 +162,8 @@ Documented as *reduced, not eliminated* — full injection defense remains futur
 
 | Step | Work | Verify |
 |------|------|--------|
-| 1 | Host setup docs + `extra_hosts` in compose; reachability check at startup. | Container can curl Ollama; clear message if not. |
-| 2 | `app/rag/llm.py` Ollama client (config-driven, timeouts, errors). | Unit test with mocked HTTP. |
+| 1 | Host setup docs + **scoped** `extra_hosts` in compose (Ollama host:port only); reachability check at startup. | Container can reach Ollama; clear message if not; no general internet egress added. |
+| 2 | `app/rag/llm/` provider interface + `OllamaProvider` (config-driven, **hard timeout + response cap**, target-host validation, errors). | Unit test with mocked HTTP, incl. timeout/cap behavior. |
 | 3 | `qa.py` LLM answering + injection-resistant prompt; reuse retrieval + sources. | Unit test: prompt shape, sources passthrough. |
 | 4 | UI toggle + graceful fallback + audit fields. | Manual: toggle works; LLM-down falls back to extractive. |
 | 5 | Docs: security_model, threat_model, README, .env.example. | Docs match code. |
