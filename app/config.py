@@ -13,6 +13,11 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlparse
+
+# Providers the factory knows about. Only "ollama" is implemented this phase;
+# the others are documented slots (see docs/phase_llm_plan.md §10).
+_KNOWN_PROVIDERS = {"ollama", "anthropic", "openai"}
 
 # Optional: load a local .env in development. In the container, real environment
 # variables are used and python-dotenv simply finds nothing to load.
@@ -73,6 +78,16 @@ class Config:
     app_env: str
     log_level: str
 
+    # --- Optional local LLM (answering backend; default OFF) ---
+    # When disabled the app is byte-for-byte V1 (extractive, no egress, no model).
+    # Defaulted so existing constructors (and tests) need not specify them.
+    llm_enabled: bool = False
+    llm_provider: str = "ollama"   # "ollama" (built) | "anthropic"/"openai" (slots)
+    llm_model: str = "llama3.2:1b" # swappable, no code change
+    llm_base_url: str = "http://host.docker.internal:11434"  # ONLY network target
+    llm_timeout_s: int = 30        # hard timeout — bounds a slow/runaway generation
+    llm_max_tokens: int = 512      # response size cap — bounds output
+
     @property
     def max_upload_bytes(self) -> int:
         return self.max_upload_mb * 1024 * 1024
@@ -107,6 +122,12 @@ def load_config() -> Config:
         chunk_size=_get_int("CHUNK_SIZE", 800),
         chunk_overlap=_get_int("CHUNK_OVERLAP", 120),
         retrieval_top_k=_get_int("RETRIEVAL_TOP_K", 4),
+        llm_enabled=_get_bool("LLM_ENABLED", False),
+        llm_provider=os.getenv("LLM_PROVIDER", "ollama").strip().lower(),
+        llm_model=os.getenv("LLM_MODEL", "llama3.2:1b"),
+        llm_base_url=os.getenv("LLM_BASE_URL", "http://host.docker.internal:11434").rstrip("/"),
+        llm_timeout_s=_get_int("LLM_TIMEOUT_S", 30),
+        llm_max_tokens=_get_int("LLM_MAX_TOKENS", 512),
         app_env=os.getenv("APP_ENV", "production"),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
     )
@@ -125,6 +146,29 @@ def _validate(cfg: Config) -> None:
         raise ConfigError("RETRIEVAL_TOP_K must be a positive integer.")
     if not cfg.allowed_extensions:
         raise ConfigError("ALLOWED_EXTENSIONS must list at least one extension.")
+
+    # --- LLM config validation (only meaningful when enabled) ---
+    if cfg.llm_enabled:
+        if cfg.llm_provider not in _KNOWN_PROVIDERS:
+            raise ConfigError(
+                f"LLM_PROVIDER {cfg.llm_provider!r} is not recognized. "
+                f"Known: {sorted(_KNOWN_PROVIDERS)}."
+            )
+        if not cfg.llm_model:
+            raise ConfigError("LLM_MODEL must be set when LLM_ENABLED is true.")
+        # The base URL is the single permitted network destination — require a
+        # well-formed http(s) URL with a host, so a malformed/hostile value can't
+        # be used as the call target.
+        parsed = urlparse(cfg.llm_base_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ConfigError(
+                "LLM_BASE_URL must be a valid http(s) URL, e.g. "
+                "http://host.docker.internal:11434."
+            )
+        if cfg.llm_timeout_s <= 0:
+            raise ConfigError("LLM_TIMEOUT_S must be a positive integer.")
+        if cfg.llm_max_tokens <= 0:
+            raise ConfigError("LLM_MAX_TOKENS must be a positive integer.")
 
 
 # Module-level singleton, lazily built on first import use.

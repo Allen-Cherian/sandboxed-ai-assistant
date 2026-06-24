@@ -8,7 +8,13 @@ phase section. See `implementation_plan.md` for the full plan and
 
 ## Current Status Summary
 
-- **Status:** ✅ **V1 COMPLETE & VERIFIED RUNNING** — all 8 phases done; confirmed
+- **Status:** ✅ V1 complete & verified. **LLM phase: Steps 1–5 done** (code +
+  docs complete). Only Step 6 remains: **live M4 check** (install Ollama, pull model,
+  toggle Generated) — needs your hardware.
+- **LLM phase tests:** 63 passing (47 V1 + 16 new LLM). UI is Streamlit (not unit
+  tested); import graph verified clean.
+
+- **Status (V1):** ✅ **V1 COMPLETE & VERIFIED RUNNING** — all 8 phases done; confirmed
   end-to-end on real hardware (Apple Silicon, Docker) on 2026-06-22.
 - **Overall:** Live demo works: README.md uploaded → indexed (12 chunks) → question
   asked → grounded passages returned with relevance scores + source attribution, fully
@@ -19,6 +25,166 @@ phase section. See `implementation_plan.md` for the full plan and
 - **Blockers:** none.
 - **Next step:** none for V1 (user chose to stop here). Future extensibility — better
   extractive tuning, local/API LLM answerer — listed in plan §9 / threat model §4.
+
+---
+
+## LLM Phase — Step 1–2: config, scoped egress, provider abstraction  ✅ (2026-06-23)
+
+Adds an **optional** local-LLM answering backend (default OFF). Plan:
+`docs/phase_llm_plan.md`.
+
+**Completed**
+- `app/config.py` — new LLM config (all defaulted, so existing constructors/tests
+  are untouched): `LLM_ENABLED` (default false), `LLM_PROVIDER` (ollama),
+  `LLM_MODEL` (llama3.2:1b), `LLM_BASE_URL`, `LLM_TIMEOUT_S`, `LLM_MAX_TOKENS`.
+  Validation runs **only when enabled**; rejects unknown provider + malformed
+  `LLM_BASE_URL` (must be a valid http(s) URL — the single permitted call target).
+- `app/rag/llm/__init__.py` — `LLMProvider` interface (`generate`/`health`) +
+  `get_provider(cfg)` factory (deny unknown) + `provider_health` helper. The LLM is
+  a **text generator, not an agent** — gets no tools.
+- `app/rag/llm/ollama_provider.py` — `OllamaProvider` via stdlib `urllib` (no new
+  dep). Security props: single config-controlled destination, **hard timeout**,
+  **response-size cap** (`num_predict`), clear errors, non-raising `health()`.
+- `app/rag/llm/api_providers.py` — Anthropic/OpenAI reserved slots that raise a clear
+  `NotImplementedError`-style `LLMError` pointing to plan §10.
+- `app/startup.py` — audit event now includes LLM fields; **non-blocking**
+  `_check_llm_reachable` (only when enabled) logs `llm_health` and never crashes.
+- `docker-compose.yml` — `extra_hosts: host.docker.internal:host-gateway` (localhost
+  mapping to host Ollama; **not** general internet egress).
+- `.env.example` — documented all `LLM_*` vars + host setup (install Ollama, pull
+  model) + reserved API-key slots.
+
+**Verification**
+- `pytest tests/` → **58 passed** (47 V1 + 11 new in `test_llm_config_provider.py`:
+  config defaults/validation, provider selection, Ollama generate/empty/unreachable,
+  health). ✅
+- Startup smoke test (LLM **disabled**) → boots, audit shows `llm_enabled:false`. ✅
+- Startup smoke test (LLM **enabled, Ollama unreachable**) → boots anyway, logs
+  `llm_health reachable:false` with reason, **no crash**. ✅ (graceful degradation)
+- All 21 app modules AST-parse. ✅
+
+**Decisions / tradeoffs**
+- LLM fields **defaulted + moved to end** of the `Config` dataclass so the 6 new
+  fields don't break existing keyword-based `Config(...)` constructions in tests.
+- Used **stdlib `urllib`** for the Ollama client — no new dependency, and no HTTP
+  client that could silently reach a different host.
+- Wrote the `OllamaProvider` (nominally Step 2) now because Step 1's reachability
+  check needs its `health()`.
+
+**Remaining next (Step 3+)**
+- `qa.py`: `answer_question_llm` — grounded, injection-resistant prompt →
+  `get_provider().generate()` → answer + same sources. Step 4: UI toggle + fallback.
+  Step 5: security/threat/README docs. Step 6: tests + live M4 check.
+
+**Risks / blockers** — none. Live container→host-Ollama call is only verifiable on
+the M4 (no Docker/Ollama in this authoring env); code degrades gracefully if down.
+
+---
+
+## LLM Phase — Step 3: LLM answering in qa.py  ✅ (2026-06-23)
+
+**Completed**
+- `app/rag/qa.py` — added `answer_question_llm(...)` alongside the unchanged
+  extractive `answer_question(...)`. Both share `_retrieve_relevant()` (same tool
+  boundary). `Answer` gained `mode` ("extractive"|"llm") and `note` fields.
+- **Injection-resistant prompt** (`_build_grounded_prompt` + `_SYSTEM_INSTRUCTION`):
+  context wrapped in explicit `BEGIN/END CONTEXT (untrusted document data)`
+  delimiters; system rules say use ONLY the context, treat context as data not
+  instructions, never obey directives found inside it, and say so if the answer
+  isn't present. (Plan §5 mitigations 1–2.)
+- **Grounding gate:** if retrieval finds nothing relevant, the LLM is **not invoked**
+  at all (no ungrounded generation) — returns the same no-match message.
+- **Graceful fallback:** any LLM failure (unbuilt/unreachable/timeout/empty) returns
+  the extractive answer with an explanatory `note`. The user always gets an answer.
+- Lazy `from app.rag.llm import get_provider` inside the LLM path so the extractive
+  path never depends on the LLM layer.
+
+**Verification**
+- `pytest tests/` → **63 passed** (+5 in `test_qa_llm.py`: grounded LLM answer,
+  fallback on failure, fallback on empty, no-match skips the LLM entirely,
+  injection-resistant prompt shape). ✅
+- `qa.py` AST-parses. ✅
+
+**Decisions / tradeoffs**
+- LLM is invoked **only when there's grounding** — both a quality and a security
+  choice (no ungrounded hallucination; smaller injection surface).
+- Fallback preserves UX: an LLM outage silently degrades to V1 behavior + a note,
+  never an error page.
+
+**Remaining next (Step 4+)**
+- UI: a mode toggle (Extractive ⟷ Generated), enabled only when `LLM_ENABLED` and the
+  provider is healthy; show `note` on fallback; new audit fields (mode/model/latency).
+  Then Step 5 (docs) + Step 6 (live M4 check).
+
+**Risks / blockers** — none.
+
+---
+
+## LLM Phase — Step 4: UI toggle + fallback + audit  ✅ (2026-06-23)
+
+**Completed**
+- `app/main.py` — `_render_mode_selector(cfg)`: shows an **Answer mode** radio
+  (Extractive ⟷ Generated) **only** when `LLM_ENABLED` *and* the provider is reachable.
+  If enabled-but-unreachable, shows a caption and silently stays extractive (V1
+  default). Health probe cached in `st.session_state` so it doesn't run every rerun.
+- `_render_ask` routes to `answer_question_llm` or `answer_question` per the toggle;
+  times the call (`time.monotonic`); displays the fallback `note` (if any) as a
+  warning above the answer.
+- Richer `question_asked` audit: `mode`, `model` (only when llm), `grounded`,
+  `latency_ms`, `fell_back`, plus the existing per-source name/score. `qa_failed`
+  now records `mode` too.
+- Import cleanup (`time` with stdlib imports; new `provider_health` / `answer_question_llm`).
+
+**Verification**
+- `pytest tests/` → **63 passed** (UI itself is Streamlit, not unit-tested). ✅
+- `main.py` AST-parses; full app import graph resolves cleanly (no circular imports,
+  no missing symbols). ✅
+
+**Decisions / tradeoffs**
+- The LLM toggle only appears when the backend is actually usable — a non-technical
+  user never sees an option that would just error. Default selection is Extractive.
+- Health cached per session (not per rerun) to avoid probing Ollama on every keystroke.
+
+**Remaining next (Step 5–6)**
+- Step 5: update `security_model.md` (egress + LLM mode + injection mitigation),
+  `threat_model.md`, README (LLM section + setup), and the audit-event list.
+- Step 6: live check on the M4 (install Ollama, pull `llama3.2:1b`, toggle Generated).
+
+**Risks / blockers** — none. The container→host-Ollama call + model quality are only
+verifiable live on the M4.
+
+---
+
+## LLM Phase — Step 5: documentation  ✅ (2026-06-23)
+
+**Completed**
+- `docs/security_model.md` — added **§7 Optional LLM Answering Mode** (off-by-default,
+  text-generator-not-agent, local-only egress, bounded execution, grounding gate,
+  basic injection mitigation, future-API-provider caveat). Updated §2 (scoped opt-in
+  egress), §4 (LLM downstream of allow-list, no tools), §6 (new audit fields), §8
+  (egress note), §9 (injection now *partially* mitigated). Renumbered Threat
+  Assumptions→§8, Limitations→§9, Change Log→§10; fixed cross-refs. Numbering verified
+  clean (1–10, no collisions).
+- `docs/threat_model.md` — header now covers default + LLM mode; §3 updated
+  (data-exfil now local-only incl. Ollama; DoS row includes LLM timeout/cap; **new
+  prompt-injection (LLM mode) row**); §4 reframed "full injection defense" as the
+  accepted gap.
+- `README.md` — new **"🤖 Optional: generated answers with a local LLM"** section
+  (host setup: install Ollama + pull model + enable; security summary; cloud-provider
+  caveat). Added `llm_health` to the audit list, the `LLM_*` rows to the config table,
+  and `phase_llm_plan.md` + `agentic_future.md` to the Documentation index.
+
+**Verification**
+- `pytest tests/` → **63 passed** (docs-only changes; nothing referenced a renamed
+  symbol). ✅
+- Security-model section numbering verified contiguous 1–10. ✅
+
+**Remaining next (Step 6 — needs the M4)**
+- Install Ollama on the host, `ollama pull llama3.2:1b`, set `LLM_ENABLED=true`,
+  rebuild, toggle **Generated**, confirm a grounded written answer + the audit
+  `mode:llm` / `latency_ms` fields, and confirm graceful fallback when Ollama is off.
+
+**Risks / blockers** — none. Step 6 is a live hardware check only.
 
 ---
 

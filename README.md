@@ -129,9 +129,46 @@ full security design in `docs/security_model.md`.
 Logged to stdout and `logs/audit.log.jsonl` (one JSON object per line):
 
 `app_startup`, `upload_stored`, `upload_rejected`, `index_completed`, `index_failed`,
-`question_asked`, `qa_failed`, `tool_invoked`, `tool_denied`, `tool_error`.
+`question_asked`, `qa_failed`, `tool_invoked`, `tool_denied`, `tool_error`,
+`llm_health`.
 
 Secret-looking fields (`*_KEY`, `*_TOKEN`, `*_SECRET`, `PASSWORD`) are auto-redacted.
+
+---
+
+## 🤖 Optional: generated answers with a local LLM
+
+By default the app answers **extractively** — it quotes the most relevant passages
+(fully local, no model, no network). You can optionally enable a **local LLM** to get
+written, prose answers grounded in those same passages.
+
+This stays **fully local** (no API key, no data leaves your machine) and is **off by
+default**. One-time host setup:
+
+```bash
+# 1. Install Ollama on your host (not in the container)
+brew install ollama            # macOS — or download from https://ollama.com
+
+# 2. Pull a lightweight model
+ollama pull llama3.2:1b
+
+# 3. Enable it in .env, then restart the app
+#    LLM_ENABLED=true
+```
+
+The app reaches host Ollama at `host.docker.internal:11434` (a localhost-only mapping,
+**not** general internet access). In the UI, pick **Generated** in the *Answer mode*
+selector. Swap models any time by `ollama pull <model>` and setting `LLM_MODEL`.
+
+**Security:** the LLM is a *text generator, not an agent* — it gets no tools and never
+touches the filesystem; retrieval still goes through the allow-list first. The call is
+bounded by a timeout + response cap, and any LLM failure falls back to extractive. A
+basic prompt-injection mitigation treats document text as untrusted data. See
+`docs/security_model.md` §7 and `docs/phase_llm_plan.md`.
+
+> Switching to a cloud provider (Claude/OpenAI) is a documented future slot
+> (`docs/phase_llm_plan.md` §10) — that *would* send document text off-machine and is
+> a conscious opt-in, not enabled here.
 
 ---
 
@@ -150,6 +187,11 @@ All optional — V1 runs with defaults and **no credentials**. Set in `.env`:
 | `RETRIEVAL_TOP_K` | `4` | Chunks retrieved per question. |
 | `APP_ENV` | `production` | Environment label (logged). |
 | `LOG_LEVEL` | `INFO` | Logging verbosity. |
+| `LLM_ENABLED` | `false` | Enable optional local-LLM generated answers. |
+| `LLM_PROVIDER` | `ollama` | LLM backend (`ollama`; `anthropic`/`openai` reserved). |
+| `LLM_MODEL` | `llama3.2:1b` | Local model name (swappable). |
+| `LLM_BASE_URL` | `http://host.docker.internal:11434` | Ollama endpoint (only network target). |
+| `LLM_TIMEOUT_S` / `LLM_MAX_TOKENS` | `30` / `512` | LLM call timeout + response cap. |
 
 ---
 
@@ -190,4 +232,6 @@ full, honest list.
 | [`docs/tool_boundary_explained.md`](docs/tool_boundary_explained.md) | Line-level code walkthrough of the least-privilege tool allow-list (the *mechanism*). | …you want to see how least privilege is wired. |
 | [`docs/threat_model.md`](docs/threat_model.md) | Assets, trust boundaries, threats→mitigations, and explicitly-accepted risks. | …you want the "what we defend / what we don't." |
 | [`docs/setup_flow.md`](docs/setup_flow.md) | The exact one-command setup experience, first-run vs. repeat, reset. | …you're setting it up or troubleshooting. |
+| [`docs/phase_llm_plan.md`](docs/phase_llm_plan.md) | Plan for the optional local-LLM answering mode (provider abstraction, egress scoping, injection mitigation). | …you want the LLM mode's design + how to add a cloud provider. |
+| [`docs/agentic_future.md`](docs/agentic_future.md) | Why there's no "agent" today and what going agentic/multi-agent would require. | …you're considering letting the LLM make decisions. |
 | [`docs/progress_log.md`](docs/progress_log.md) | The full phase-by-phase build and bring-up history. | …you want the development story. |

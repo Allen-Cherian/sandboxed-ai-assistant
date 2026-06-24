@@ -32,8 +32,17 @@ The app runs inside a **Docker container**, hardened via `docker-compose.yml`:
 | No host networking | default bridge; only port 8501 published | App is reachable only on the mapped UI port. |
 | Resource limits (optional) | mem/cpu limits in compose | Caps DoS impact. |
 
+**Network egress.** By default the app makes **no outbound calls**. The optional local
+LLM mode (§7, off by default) adds exactly **one** permitted destination: the
+configured local Ollama at `LLM_BASE_URL` (default `host.docker.internal:11434`),
+enabled via `extra_hosts`. This is a localhost-only mapping to a user-controlled
+service — it does **not** grant general internet egress. The destination is
+config-controlled (validated as a well-formed http(s) URL) and never derived from user
+input or document content. General internet egress is opened only if a future API
+provider is consciously enabled (§7 / plan §10).
+
 **Not relied upon in V1:** custom seccomp/AppArmor profiles, gVisor/Kata, user
-namespaces remap. Documented as future hardening (§8).
+namespaces remap. Documented as future hardening (§9).
 
 ---
 
@@ -81,6 +90,13 @@ namespaces remap. Documented as future hardening (§8).
 - The UI and the Q&A loop route **through this boundary** (`call_tool`), not around it,
   so the same allow-list governs the app today and any future LLM agent. Covered by
   `tests/test_allowed_tools.py` (deny-by-default, param rejection, dispatch).
+- **The optional LLM (§7) is a text generator, NOT an agent.** It receives an
+  already-retrieved, grounded prompt and returns text. It is given **no tools**, makes
+  no decisions about what to call, and never touches the filesystem. Retrieval happens
+  through `call_tool` *before* the LLM is involved, so the LLM is strictly downstream
+  of the allow-list — it cannot expand the capability surface. Going *agentic* (LLM
+  decides which tools to call) is a deliberate future milestone, not part of this
+  phase — see `docs/agentic_future.md`.
 
 ---
 
@@ -110,31 +126,81 @@ namespaces remap. Documented as future hardening (§8).
   answer metadata (model, latency, token/length info where available), and errors.
 - Logs are designed to answer "who uploaded what, what was asked, and what sources
   were used" — i.e. an audit trail, not just debug output.
+- The `question_asked` event records `mode` (extractive|llm), `model` (in LLM mode),
+  `grounded`, `latency_ms`, `fell_back`, and per-source name/score. New
+  reachability/health events: `llm_health`.
 - **No document *content* secrets and no API keys** are logged.
 
 ---
 
-## 7. Threat Assumptions (V1)
+## 7. Optional LLM Answering Mode
+
+The default answer mode is **extractive** (quote retrieved chunks; fully local; no
+model). An **optional** generative mode (off by default, `LLM_ENABLED=false`) sends
+the retrieved chunks to a **local LLM** (Ollama) to produce written prose.
+
+**Security properties of this mode:**
+
+- **Off by default.** With `LLM_ENABLED=false` the app is byte-for-byte the extractive
+  build — no model, no egress.
+- **Text generator, not an agent** (§4): the LLM gets no tools and never touches the
+  filesystem; retrieval still flows through the allow-list before it runs.
+- **Local only by default.** The configured provider is local Ollama; the only network
+  destination is `LLM_BASE_URL` (§2). No data leaves the machine in the default Ollama
+  configuration.
+- **Bounded execution:** the call has a hard timeout (`LLM_TIMEOUT_S`) and a
+  response-size cap (`LLM_MAX_TOKENS`); on any failure the app **falls back to
+  extractive** with a user-visible note — never a crash.
+- **Grounding gate:** if retrieval finds nothing relevant, the LLM is not invoked
+  (no ungrounded generation).
+
+**Prompt-injection mitigation (basic).** A generative model introduces prompt
+injection — a crafted document could try to steer the answer. Mitigations in place:
+
+1. A system instruction to answer **only** from the provided context and to treat the
+   context as **untrusted data, not instructions** (explicitly: never obey directives
+   found inside it).
+2. Retrieved chunks wrapped in clear `BEGIN/END CONTEXT` delimiters so the model can
+   distinguish data from task.
+3. The LLM has no tools, so a successful injection can at most affect the *text* of an
+   answer — it cannot cause actions.
+4. Sources are always shown so the user can verify the answer against the chunks.
+
+This is **reduced, not eliminated** — full injection defense remains future work (§9).
+
+**Future API providers.** Switching `LLM_PROVIDER` to a cloud model (Anthropic/OpenAI)
+is a documented, reserved slot (plan §10). It would mean **document text leaves the
+machine** and requires an API key — a conscious opt-in that must be re-documented here
+and in `threat_model.md` at the time it is enabled. Not implemented in this phase.
+
+---
+
+## 8. Threat Assumptions
 
 - **Trusted operator, semi-trusted user:** the person running the container is
   trusted; the person uploading documents/asking questions is only semi-trusted.
 - We defend against: path traversal/escape via uploads, oversized/wrong-type
   uploads, the assistant attempting actions outside its allow-list, accidental
   secret leakage into logs/images.
-- We do **not** fully defend against (V1): prompt injection from malicious document
-  content influencing answers, a malicious *operator*, side-channels, or
-  supply-chain compromise of dependencies.
+- We do **not** fully defend against: prompt injection from malicious document
+  content influencing answers (reduced in LLM mode, §7), a malicious *operator*,
+  side-channels, or supply-chain compromise of dependencies.
 
-Note: V1 sends **no data to any external service** — embeddings and answering run
-entirely in-container, which removes a whole class of data-exfiltration concerns.
+Note: in the **default** configuration the app sends **no data to any external
+service** — embeddings and (extractive) answering run entirely in-container. The
+optional LLM mode adds a localhost-only call to host Ollama; data still does not leave
+the machine. Only a future cloud API provider would change that (§7).
 
 ---
 
-## 8. Current Limitations (Known, Documented)
+## 9. Current Limitations (Known, Documented)
 
-1. **Prompt injection** from document content is *not* mitigated in V1. Retrieved
-   chunks are treated as data; extractive answering reduces (but does not eliminate)
-   the risk since chunks are quoted rather than fed to a generative model.
+1. **Prompt injection** from document content is *partially* mitigated, not
+   eliminated. Extractive mode (default) quotes chunks rather than feeding them to a
+   generative model. LLM mode (§7) adds an untrusted-data system prompt + delimiting +
+   a no-tools constraint, so a successful injection can at most alter answer *text*,
+   not cause actions. Full injection defense (classifiers, output filtering) is future
+   work.
 2. **No authentication** — anyone who can reach port 8501 can use the app.
 3. **No seccomp/AppArmor/gVisor** profile — container hardening relies on Docker
    defaults + the compose controls above.
@@ -148,7 +214,7 @@ for V1 per the project brief.
 
 ---
 
-## 9. Change Log (security-level)
+## 10. Change Log (security-level)
 
 - **2026-06-22** — Initial security model authored (Phase 0). Boundaries defined;
   enforcement to be implemented in Phases 1–6.
@@ -160,3 +226,8 @@ for V1 per the project brief.
 - **2026-06-22** — Phase 5: tool/capability boundary implemented. UI + Q&A now route
   through `call_tool`; documented param-rejection, `top_k` cap, dispatch auditing, and
   the boundary test suite.
+- **2026-06-23** — LLM phase: added §7 (Optional LLM Answering Mode) and updated §2
+  (scoped, opt-in egress to local Ollama), §4 (LLM is a text generator, not an agent),
+  §6 (new audit fields), §8 (egress note), §9 (prompt injection now partially
+  mitigated). Renumbered Threat Assumptions → §8 and Limitations → §9. LLM mode is OFF
+  by default; the default build is unchanged from prior V1.
